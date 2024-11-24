@@ -401,6 +401,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32-c6"
+version = "0.2.3-dev"
+dependencies = [
+ "esp32",
+ "kernel",
+ "rv32i",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
