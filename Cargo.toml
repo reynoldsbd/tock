@@ -18,6 +18,7 @@ members = [
     "boards/arty_e21",
     "boards/opentitan/earlgrey-cw310",
     "boards/esp32-c3-devkitM-1",
+    "boards/esp32-c6-devkitC-1",
     "boards/clue_nrf52840",
     "boards/veer_el2_sim",
     "boards/hail",
