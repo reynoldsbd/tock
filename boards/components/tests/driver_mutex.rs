@@ -72,7 +72,13 @@ fn driver_mutex_ownership() {
     assert!(second.guards.borrow().is_empty());
     assert!(!DeferredCall::has_tasks());
     assert_eq!(mutex.request(second_handle), Err(ErrorCode::ALREADY));
+    assert_eq!(mutex.request(first_handle), Ok(()));
     assert_eq!(mutex.request(first_handle), Err(ErrorCode::ALREADY));
+    assert_eq!(first.guards.borrow().len(), 1);
+    service();
+    assert_eq!(first.guards.borrow().len(), 2);
+    drop(first.guards.borrow_mut().pop().unwrap());
+    assert!(second.guards.borrow().is_empty());
     assert!(!DeferredCall::has_tasks());
 
     let erased = first.guards.borrow_mut().pop().unwrap();
@@ -108,5 +114,22 @@ fn driver_mutex_ownership() {
     assert_eq!(mutex.request(third_handle), Ok(()));
     service();
     third.guards.borrow_mut().clear();
+    assert!(!DeferredCall::has_tasks());
+
+    assert_eq!(mutex.request(first_handle), Ok(()));
+    service();
+    assert_eq!(mutex.request(second_handle), Ok(()));
+    assert_eq!(mutex.request(first_handle), Ok(()));
+    first.guards.borrow_mut().clear();
+    assert!(second.guards.borrow().is_empty());
+    assert_eq!(mutex.request(first_handle), Err(ErrorCode::ALREADY));
+    service();
+    assert_eq!(first.guards.borrow().len(), 1);
+    assert!(second.guards.borrow().is_empty());
+    assert!(!DeferredCall::has_tasks());
+    first.guards.borrow_mut().clear();
+    service();
+    assert_eq!(second.guards.borrow().len(), 1);
+    second.guards.borrow_mut().clear();
     assert!(!DeferredCall::has_tasks());
 }
