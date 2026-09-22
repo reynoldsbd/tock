@@ -62,12 +62,6 @@ enum State {
     Locked {
         /// Handle of the client which currently holds the lock
         handle: DriverMutexHandle,
-
-        /// Counts the number of references held by the client
-        ref_count: usize,
-
-        /// Whether the current client has requested another ready callback
-        pending: bool,
     },
 }
 
@@ -88,38 +82,11 @@ struct Inner {
 }
 
 impl Inner {
-    /// Called whenever a [`DriverMutexRef`] or [`DriverMutexAny`] is dropped. Decrements the
-    /// reference count. When no references remain and no callback is pending from the same client,
-    /// releases the mutex and schedules a callback for next queued client.
-    fn ref_dropped(&self) {
-        let mut state = self.state.borrow_mut();
-        let should_release = match &mut *state {
-            // Internal invariant violated. Mutex _thinks_ it's free, yet clearly there was some ref
-            // floating around that we didn't account for.
-            State::Free => unreachable!(),
-
-            State::Locked {
-                ref_count, pending, ..
-            } => {
-                // Decrement the ref count
-                *ref_count -= 1;
-
-                // Keep the mutex locked if the active client has a pending ready callback. In that
-                // state there may be no live references, but ownership should not pass to the next
-                // queued client yet.
-                *ref_count == 0 && !*pending
-            }
-        };
-
-        // Release the mutex only when no references remain and no callback is pending.
-        if should_release {
-            mem::drop(state);
-            self.state.replace(State::Free);
-
-            // If another client is queued, then schedule its ready() callback.
-            if self.queue.borrow().has_elements() {
-                self.dc.set();
-            }
+    /// Release the mutex when its guard is dropped and schedule the next queued client.
+    fn release(&self) {
+        self.state.replace(State::Free);
+        if self.queue.borrow().has_elements() {
+            self.dc.set();
         }
     }
 }
@@ -149,54 +116,15 @@ impl Inner {
 /// assurance at compile time that the underlying resource can only be accessed _while_ the mutex is
 /// held.
 ///
-/// When the last guard for the active client is dropped, the mutex is effectively released. If
+/// Each acquisition provides one guard. When that guard is dropped, the mutex is released. If
 /// another client is queued, a new RAII guard is passed to its
 /// [`ready()`][DriverMutexClient::ready] callback. This process is carried out within a
 /// [deferred call][DeferredCall] to avoid doing too much work directly within the RAII `drop()`
 /// method, which could otherwise lead to reentrancy hazards, poor performance, or overly deep call
 /// stacks.
 ///
-/// ## Reference Counting
-///
-/// To support more complex scenarios, the same client may request access to the mutex multiple
-/// times. Instead of being added to the internal queue, the client's `ready()` callback is
-/// scheduled again, even while the client still holds one or more `DriverMutexAny` or
-/// `DriverMutexRef` instances.
-///
-/// Internally, the mutex maintains a count of each reference provided through the `ready()`
-/// callback. This count is decremented whenever a reference is dropped. The mutex considers the
-/// resource to be free only when this count reaches zero, at which point a new `ready()` callback
-/// is scheduled for the next client from the queue.
-///
-/// Due to the asynchronous nature of this mutex, it is possible for a client to call `request()`,
-/// then drop all its outstanding RAII guards _before_ the `ready()` callback is invoked, causing
-/// the reference count to reach zero. The `DriverMutex` explicitly handles this case, ensuring the
-/// resource remains locked until the pending `ready()` callback can be delivered.
-///
-/// Note that clients are still not permitted to have multiple outstanding requests. Each time a
-/// client calls `request()`, it must wait until its `ready()` callback is invoked before calling
-/// `request()` again.
-///
-/// ### Motivation for Reference Counting
-///
-/// Why go to the lengths of supporting this admittedly complex scheme?
-///
-/// It turns out there are some real world scenarios in which a kernel component needs to consume
-/// services from multiple different HIL implementations, `A: Foo` and `B: Bar`. This component
-/// would typically contain two references `&DriverMutex<A>` and `&DriverMutex<B>` which it can use
-/// to access the corresponding drivers.
-///
-/// But depending on the topology of the underlying chip or board, the `Foo` and `Bar` traits may
-/// either be implemented by different drivers or possibly by the same driver. For instance, some
-/// chips may implement ECC and RSA acceleration using a generic "crypto" IP block, while other
-/// chips may provide separate blocks (and thus separate drivers) for these functions.
-///
-/// By using the reference counting approach, drivers which consume `Foo` and `Bar` can be written
-/// to support both topologies transparently. The respective mutexes for `A` and `B` may point to
-/// different drivers. Or in the case that `A` and `B` are actually the same type, both of the
-/// consumer's `&DriverMutex` references may literally refer back to the same individual mutex
-/// instance. Either way, the consumer may use the same set of APIs to access the underlying
-/// resource.
+/// A client may have either one queued request or one active guard per mutex. It must drop its
+/// guard before requesting that mutex again. Different mutexes may be acquired independently.
 pub struct DriverMutex<T: 'static> {
     resource: &'static T,
     inner: Inner,
@@ -269,7 +197,8 @@ impl<T> DriverMutex<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorCode::ALREADY`] if the client is already waiting in the queue.
+    /// Returns [`ErrorCode::ALREADY`] if the client is already waiting in the queue or holds
+    /// the active guard.
     ///
     /// Returns [`ErrorCode::INVAL`] if passed a `handle` created from a different `DriverMutex`
     /// instance.
@@ -286,52 +215,21 @@ impl<T> DriverMutex<T> {
             return Err(ErrorCode::ALREADY);
         }
 
-        // Whether to add this request to the queue of clients awaiting callbacks
-        let should_enqueue;
-
-        // Whether to schedule the deferred call.
-        let should_sched;
-
-        match &mut *self.inner.state.borrow_mut() {
-            // No outstanding references.
-            State::Free => {
-                // Enqueue and schedule a callback.
-                should_enqueue = true;
-                should_sched = true;
+        let should_schedule = match &*self.inner.state.borrow() {
+            State::Free => true,
+            State::Locked { handle: client } if *client == handle => {
+                return Err(ErrorCode::ALREADY);
             }
+            State::Locked { .. } => false,
+        };
 
-            // Currently active client requesting another reference
-            State::Locked {
-                handle: client,
-                pending,
-                ..
-            } if *client == handle => {
-                if *pending {
-                    // Active client already has a pending callback
-                    return Err(ErrorCode::ALREADY);
-                }
-
-                // Skip enqueuing and schedule another callback for the active client.
-                *pending = true;
-                should_enqueue = false;
-                should_sched = true;
-            }
-
-            // Requestor is different from currently active client
-            State::Locked { .. } => {
-                // Add to the queue, but wait for the active client to fully release the resource.
-                should_enqueue = true;
-                should_sched = false;
-            }
-        }
-
-        if should_enqueue && !queue.enqueue(handle.client_index) {
+        if !queue.enqueue(handle.client_index) {
             // Queue length should match the component's client capacity, so this should be
             // unreachable if handles are valid and duplicate requests are rejected.
             return Err(ErrorCode::FAIL);
         }
 
-        if should_sched {
+        if should_schedule {
             self.inner.dc.set();
         }
 
@@ -357,34 +255,13 @@ impl<T> DeferredCallClient for DriverMutex<T> {
                         client_index,
                         mutex_ptr,
                     },
-                    ref_count: 1,
-                    pending: false,
                 };
 
                 // Dispatch ready callback to the newly popped client
                 client_index
             }
 
-            // Mutex is currently locked by a client
-            State::Locked {
-                handle,
-                ref_count,
-                pending,
-            } => {
-                if !*pending {
-                    // Unexpected callback: active client has no pending request
-                    return;
-                }
-
-                // Increment reference count
-                *ref_count += 1;
-
-                // Ensure pending flag is cleared
-                *pending = false;
-
-                // Dispatch ready callback to the currently active client
-                handle.client_index
-            }
+            State::Locked { .. } => return,
         };
 
         let resource_ref = DriverMutexAny {
@@ -419,7 +296,7 @@ impl DriverMutexAny {
                     inner: self.inner,
                 };
 
-                // Skip running drop for self to prevent decrementing the reference count
+                // Transfer ownership to the typed guard without releasing the mutex.
                 mem::forget(self);
 
                 Ok(new_ref)
@@ -432,7 +309,7 @@ impl DriverMutexAny {
 
 impl Drop for DriverMutexAny {
     fn drop(&mut self) {
-        self.inner.ref_dropped();
+        self.inner.release();
     }
 }
 
@@ -451,6 +328,6 @@ impl<T> Deref for DriverMutexRef<T> {
 
 impl<T> Drop for DriverMutexRef<T> {
     fn drop(&mut self) {
-        self.inner.ref_dropped();
+        self.inner.release();
     }
 }
